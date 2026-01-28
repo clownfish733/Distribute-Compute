@@ -4,14 +4,14 @@ const GET_PEERS_VOLUME: usize = 20;
 
 use tokio::{
     io::AsyncReadExt, 
-    net::TcpListener, 
-    sync::{RwLock,mpsc}
+    net::{TcpListener, TcpStream}, 
+    sync::{RwLock,mpsc::{self, UnboundedReceiver}}
 };
 
 use std::{
     collections::HashMap, 
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -282,8 +282,17 @@ pub enum P2PError{
     ProtocolViolation,
 
     #[error("Peer Disconnected")]
-    PeerDisconnect
-}
+    PeerDisconnect,
+
+    #[error("Connection timeout")]
+    Timeout,
+
+    #[error("Peer Already Connected")]
+    PeerAlreadyConnected,
+
+    #[error("Peer Not Found")]
+    PeerNotFound
+}   
 
 impl From<postcard::Error> for P2PError{
     fn from(e: postcard::Error) -> Self {
@@ -427,7 +436,7 @@ pub struct Network {
 
     pub config: NetworkConfig,
 
-    peers: Arc<RwLock<PeerDatabase>>,
+    peers: Arc<RwLock<HashMap<[u8;32], Peer>>>,
 
     peer_db: Arc<RwLock<PeerDatabase>>,
 
@@ -439,7 +448,6 @@ pub struct Network {
 
     shutdown_tx: mpsc::Sender<()>,
 }
-
 
 #[derive(Clone)]
 pub struct NetworkConfig{
@@ -604,7 +612,316 @@ impl Network{
                 .count();
 
             if outbound_count < self.config.max_outbound_peers &&
-                peer_count < self.config.max_peers
+                peer_count < self.config.max_peers {
+                 let needed = self.config.max_outbound_peers - outbound_count;
+
+                 let candidates = self.peer_db.read().await
+                    .get_candidates(needed)
+                    .await;   
+                }
+
+                for addr in candidates{
+                    let network = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        if let Err(e) = network.connect_to_peer(&addr).await {
+                            eprintln!("Failed to connect to {}: {:?}", addr, e);
+                        }
+                    });
+                }
         }
+    }
+
+    pub async fn connect_to_peer(self: &Arc<Self>, addr: &str) -> Result<(), P2PError> {
+        println!("Connecting to peer: {}", addr);
+
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+             TcpStream::connect(addr)
+            ).await
+                .map_err(|_| P2PError::Timeout)??;
+            handle_connection(stream, true, Arc::clone(&self)).await
+    }
+
+    async fn bootstrap(self: &Arc<Self>) {
+        for addr in &self.config.bootstrap_nodes {
+            let network = Arc::clone(&self);
+            let addr = addr.clone();
+            
+            tokio::spawn(async move {
+                if let Err(e) = network.connect_to_peer(&addr).await {
+                    eprintln!("Failed to connect to bootstrap node {}: {:?}", addr, e);
+                }
+            });
+        }
+    }
+
+    async fn ping_manager(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(
+            Duration::from_secs(self.config.ping_interval_secs)
+        );
+
+        loop {
+            interval.tick().await;
+
+            let peers: Vec<[u8; 32]> = self.peers.read().await
+                .keys()
+                .copied()
+                .collect();
+
+            for peer_id in peers {
+                let nonce = rand::random::<u64>();
+                let ping = PingMessage { nonce }
+                
+                if let Err(e) = self.send_to_peer(
+                    peer_id,
+                    Message::Core(CoreMessage::Ping(ping))
+                ).await {
+                    eprintln!("Failed to ping peer {:?}: {:?}", peer_id, e);
+                }
+            }
+        }
+    }
+
+    pub async fn add_peer(&self, peer: Peer) -> Result<(), P2PError> {
+        let peer_id = peer.peer_id;
+
+        if self.peers.read().await.contains_key(&peer_id) {
+            return Err(P2PError::PeerAlreadyConnected)
+        }
+
+        self.peer_db.write().await.add_peer(
+            peer_id,
+            peer.address.clone(),
+            peer.port,
+        ).await;
+
+        println!("Peer {} connected (protocol v{}, {} capabilities",
+            hex::encode(peer_id),
+            peer.protocol_version,
+            peer.capabilities.len()
+        );
+
+        self.peers.write().await.insert(peer_id, peer);
+
+        Ok(())
+    }
+
+    pub async fn remove_peer(&self, peer_id: [u8; 32]) {
+        if let Some(peer) = self.peers.write().await.remove(&peer_id) {
+            println!("Peer {} disconnected", hex::encode(peer_id));
+            
+            self.peer_db.write().await.mark_disconnected(peer_id).await;
+        }
+    }
+
+    pub async fn send_to_peer(
+        &self,
+        peer_id: [u8; 32],
+        msg: Message,
+    ) -> Result<(), P2PError> {
+        let peers = self.peers.read().await;
+
+        if let Some(peer) = peers.get(&peer_id) {
+            peer.outbount_tx.send(msg).await
+                .map_err(|_| P2PError::PeerDisconnect)
+        } else {
+            Err(P2PError::PeerNotFound)
+        }
+    }
+
+    pub async fn broadcast(&self, msg: Message) {
+        let peers = self.peers.read().await;
+
+        for peer in peers.values(){
+            let msg_clone = match &msg{
+                Message::Core(m) => Message::Core(m.clone()),
+                Message::Sync(m) => Message::Sync(m.clone()),
+                Message::TxPool(m) => Message::TxPool(m.clone()),
+                Message::Layer2(m) => Message::Layer2(m.clone()),
+                Message::Custom(m) => Message::Custom(m.clone()),
+            };
+
+            if let Err(e) = peer.outbount_tx.send(msg_clone).await {
+                eprintln!("Failed to broadcast to peer {:?}: {:?}", peer.peer_id, e)
+            }
+        }
+    }
+
+    pub async fn broadcast_to_capable(&self, capability: &str, msg: Message) {
+        let peers = self.peers.read().await;
+
+        for peer in peers.values() {
+            if !peer.capabilities.contains(&capability.to_string()) {
+                continue;
+            }
+
+            let msg_clone = match &msg {
+                Message::Core(m) => Message::Core(m.clone()),
+                Message::Sync(m) => Message::Sync(m.clone()),
+                Message::TxPool(m) => Message::TxPool(m.clone()),
+                Message::Layer2(m) => Message::Layer2(m.clone()),
+                Message::Custom(m) => Message::Custom(m.clone()),
+            };
+
+            if let Err(e) = peer.outbount_tx.send(msg_clone).await {
+                eprintln!("Failed to broadcast to peer {:?}: {:?}", peer.peer_id, e)
+            }
+        }
+    }
+
+    pub async fn get_known_peers(&self, limit: usize) -> Vec<PeerInfo> {
+        self.peer_db.read().await.get_best_peers(limit).await
+    }
+
+    pub async fn add_discovered_peers(&self, peers: Vec<PeerInfo>) {
+        let mut db = self.peer_db.write().await;
+        for peer in peers {
+            db.add_peer(peer.peer_id, peer.address, peer.port).await;
+        }
+    }
+
+    pub async fn peer_count(&self) -> usize{
+        self.peers.read().await.len()
+    }
+
+    pub async fn get_peer_stats(&self) -> PeerStats{
+        let peers = self.peers.read().await;
+
+        let total = peers.len();
+        let inbound = peers.values().filter(|p| !p.is_outbound).count();
+        let outbound = peers.values().filter(|p| p.is_outbound).count();
+
+        PeerStats{
+            total,
+            inbound,
+            outbound
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerStats{
+    pub total: usize,
+    pub inbound: usize,
+    pub outbound: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PeerInfo{
+    pub peer_id: [u8; 32],
+    pub address: String,
+    pub port: u16,
+}
+
+struct PeerRecord{
+    peer_id: [u8; 32],
+    address: String,
+    port: u16,
+    last_seen: u64,
+    last_attempted: u64,
+    successful_connections: u32,
+    failed_connections: u32,
+    reputation: i32,
+}
+
+pub struct PeerDatabase{
+    peers: HashMap<[u8;32], PeerRecord>
+}
+
+impl PeerDatabase{
+    pub fn new() -> Self {
+        Self { 
+            peers: HashMap::new() 
+        }
+    }
+
+    pub async fn add_peer(&mut self, peer_id: [u8; 32], address: String, port: u16) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.peers.entry(peer_id) 
+            .and_modify(|record| {
+                record.last_seen = now;
+                record.successful_connections += 1;
+                record.reputation += 1;
+            })
+            .or_insert(PeerRecord {
+                 peer_id, 
+                 address, 
+                 port, 
+                 last_seen: now, 
+                 last_attempted: 0, 
+                 successful_connections: 1, 
+                 failed_connections: 0, 
+                 reputation: 10 
+                });
+    }
+
+    pub async fn mark_disconnected(&mut self, peer_id: [u8; 32]) {
+        if let Some(record) = self.peers.get_mut(&peer_id) {
+            record.failed_connections += 1;
+            record.reputation -= 2;
+
+            let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        record.last_seen = now;
+        }
+    }
+
+    pub async fn mark_failed(&mut self, peer_id: [u8; 32]) {
+        if let Some(record) = self.peers.get_mut(&peer_id) {
+            record.failed_connections += 1;
+            record.reputation -= 2;
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            record.last_attempted = now;
+        }
+    }
+
+    pub async fn get_candidates(&self, count: usize) -> Vec<String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut candidates: Vec<_> = self.peers.values()
+            .filter(|r| {
+                r.reputation > 0 &&
+                now - r.last_attempted > 60
+            })
+            .collect();
+
+        candidates.sort_by_key(|r| -r.reputation);
+
+        candidates.iter()
+            .take(count)
+            .map(|r| format!("{}:{}", r.address, r.port))
+            .collect()
+    }
+
+    pub async fn get_best_peers(&self, limit: usize) -> Vec<PeerInfo> {
+        let mut peers: Vec<_> = self.peers.values()
+            .filter(|r| r.reputation > 0)
+            .collect();
+
+        peers.sort_by_key(|r| -r.reputation);
+
+        peers.iter()
+            .take(limit)
+            .map(|r| PeerInfo {
+                peer_id: r.peer_id,
+                address: r.address.clone(),
+                port: r.port,
+            })
+            .collect()
     }
 }
