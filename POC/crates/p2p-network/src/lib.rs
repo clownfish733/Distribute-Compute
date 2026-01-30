@@ -1,8 +1,10 @@
-mod network;
-mod peers;
-mod protocol;
-mod types;
-mod utils;
-mod errors;
+pub mod core;
+pub mod utils;
+pub mod wire;
+pub mod protocol;
+pub mod transport;
+pub mod peer;
+pub mod discovery;
 
-pub use errors::P2PError;
+mod network;
+pub use network::{Network};

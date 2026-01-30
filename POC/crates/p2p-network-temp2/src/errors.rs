@@ -5,7 +5,7 @@ pub enum P2PError{
     #[error("Unknown message type: 0x{0:02x}")]
     UnknownMessageType(u8),
 
-    #[error("Unknow message category: 0x{0:02x}")]
+    #[error("Unknown message category: 0x{0:02x}")]
     UnknownMessageCategory(u8),
 
     #[error("Invalid message size: {0}")]
@@ -17,19 +17,19 @@ pub enum P2PError{
     #[error("IO error: {0}")]
     IOError(String),
 
-    #[error("Protocol Violation")]
+    #[error("Protocol violation")]
     ProtocolViolation,
 
-    #[error("Peer Disconnected")]
+    #[error("Peer disconnected")]
     PeerDisconnect,
 
     #[error("Connection timeout")]
     Timeout,
 
-    #[error("Peer Already Connected")]
+    #[error("Peer already connected")]
     PeerAlreadyConnected,
 
-    #[error("Peer Not Found")]
+    #[error("Peer not found")]
     PeerNotFound
 }   
 
@@ -41,6 +41,6 @@ impl From<postcard::Error> for P2PError{
 
 impl From<std::io::Error> for P2PError{
     fn from(e: std::io::Error) -> Self {
-        P2PError::IOError(format!("IO Error: {}", e))
+        P2PError::IOError(format!("IO error: {}", e))
     }
 }
