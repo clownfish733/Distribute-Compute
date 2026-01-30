@@ -7,4 +7,3 @@ pub mod peer;
 pub mod discovery;
 
 mod network;
-pub use network::{Network};
