@@ -3,7 +3,6 @@ macro_rules! wire_message {
     ($enum_name:ident {
         $($variant:ident($type:ty) =$id:expr), * $(,)?
     }) => {
-        use crate::core::traits::WireEncodable;
         impl $enum_name{
             fn to_wire(&self) -> Result<(u8, Vec<u8>), crate::core::P2PError>
             where 
@@ -35,7 +34,7 @@ macro_rules! wire_message {
 macro_rules! message_dispatch {
     ($($variant:ident($type:ty) = $category:expr), * $(,)?) => {
         impl Message{
-            pub fn to_bytes(&self) -> Result<Vec<u8>, P2PError> {
+            pub fn to_bytes(&self) -> Result<Vec<u8>, crate::core::P2PError> {
                 let (category, type_id, payload) = match self {
                     $(
                         Message::$variant(msg) => {
@@ -54,15 +53,15 @@ macro_rules! message_dispatch {
                 Ok(buf)
             }
 
-            pub async fn from_stream<R: AsyncReadExt + Unpin>(
+            pub async fn from_stream<R: tokio::io::AsyncReadExt + Unpin>(
                 stream: &mut R,
-            ) -> Result<Self, P2PError> {
+            ) -> Result<Self, crate::core::P2PError> {
                 let mut len_buf = [0u8; 4];
                 stream.read_exact(&mut len_buf).await?;
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-                if msg_len == 0 || msg_len > MAX_MESSAGE_SIZE {
-                    return Err(P2PError::InvalidMessageSize(msg_len))
+                if msg_len == 0 || msg_len > crate::core::constants::MAX_MESSAGE_SIZE {
+                    return Err(crate::core::P2PError::InvalidMessageSize(msg_len))
                 }
 
                 let msg_type = stream.read_u8().await?;
@@ -77,7 +76,7 @@ macro_rules! message_dispatch {
                     $(
                         $category => Ok(Message::$variant(<$type>::from_wire(type_id, &payload)?)),
                     )*
-                    _ => Err(P2PError::UnknownMessageCategory(category))
+                    _ => Err(crate::core::P2PError::UnknownMessageCategory(category))
                 }
         }
         }

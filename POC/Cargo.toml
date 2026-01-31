@@ -1,9 +1,12 @@
 [workspace]
-members = ["crates/p2p-network"]
+members = [
+    "crates/p2p-network"
+    ]
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.75"
+rust-version = "1.85"
 authors = ["Daniel Greenfield"]
 license = "MIT"

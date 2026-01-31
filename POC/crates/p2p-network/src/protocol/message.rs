@@ -1,7 +1,5 @@
 use serde::{Serialize, Deserialize};
 
-use crate::message_dispatch;
-
 use super::{
     core::CoreMessage,
     sync::SyncMessage,

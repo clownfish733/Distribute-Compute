@@ -1,0 +1,8 @@
+[package]
+name = "p2p-network-file"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+protocol = { path = "protocol" }
+network = { path = "network" }
