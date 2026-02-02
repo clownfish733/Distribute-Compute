@@ -24,5 +24,4 @@ impl MessageFrame{
             payload
         }
     }
-    
 }
